@@ -7,7 +7,13 @@ from util.firestore import get_firestore_db
 load_dotenv(find_dotenv())
 
 from sys import getsizeof
-from PIL import Image, ImageFile
+try:
+    from PIL import Image, ImageFile
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    print("WARNING: PIL not available, image processing will be disabled")
 
 from time import time
 
@@ -49,12 +55,24 @@ def generate_css_bar(num_bar=75):
 
 @functools.lru_cache(maxsize=128)
 def load_image(url):
-    resposne = requests.get(url)
-    return resposne.content
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        response = requests.get(url)
+        return response.content
+    except Exception as e:
+        print(f"Error loading image: {e}")
+        return None
 
 
 def to_img_b64(content):
-    return b64encode(content).decode("ascii")
+    if content is None:
+        return ""
+    try:
+        return b64encode(content).decode("ascii")
+    except Exception as e:
+        print(f"Error encoding image: {e}")
+        return ""
 
 
 def load_image_b64(url):

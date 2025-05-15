@@ -3,7 +3,7 @@ Werkzeug==1.0.1
 requests==2.28.2
 python-dotenv==0.14.0
 firebase-admin==4.3.0
-Pillow==9.0.1
+Pillow-SIMD==9.0.0.post1
 colorgram.py==1.2.0
 markupsafe==2.0.1
 gunicorn==22.0.0

@@ -1,0 +1,19 @@
+{
+  "builds": [
+    {
+      "src": "api/*.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "api/$1.py"
+    }
+  ],
+  "build": {
+    "env": {
+      "PIP_EXTRA_INDEX_URL": "https://wheels.vercel.app"
+    }
+  }
+} 
