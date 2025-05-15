@@ -1,14 +1,8 @@
 {
-  "builds": [
-    {
-      "src": "Dockerfile",
-      "use": "@vercel/docker"
-    }
-  ],
+  "version": 2,
+  "buildCommand": "pip install -r api/requirements.txt",
+  "outputDirectory": ".",
   "routes": [
-    {
-      "src": "/api/(.*)",
-      "dest": "/api/$1"
-    }
+    { "src": "/api/(.*)", "dest": "/api/$1" }
   ]
 } 
