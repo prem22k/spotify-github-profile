@@ -1,268 +1,350 @@
-from flask import Flask, Response, redirect, request, jsonify, render_template
 import os
-import sys
-import traceback
-
-# Add the current directory to the Python path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-# Import the necessary modules
-from util import spotify
-from base64 import b64decode, b64encode
 import json
-import firebase_admin
-from firebase_admin import credentials
-from firebase_admin import firestore
+import base64
 import requests
-import random
-import html
-import functools
+import traceback
+from urllib.parse import parse_qs
 
-# Flag to track if PIL is available
-PIL_AVAILABLE = False
-try:
-    from PIL import Image, ImageFile
-    ImageFile.LOAD_TRUNCATED_IMAGES = True
-    PIL_AVAILABLE = True
-except ImportError:
-    print("PIL could not be imported - image processing features will be limited")
+# Debug info
+print("Starting server...")
 
-# Initialize Firebase
+# Environment variables
+SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID")
+SPOTIFY_SECRET_ID = os.environ.get("SPOTIFY_SECRET_ID")
+BASE_URL = os.environ.get("BASE_URL", "https://spotify-github-profile-kappa-six.vercel.app/api")
+FIREBASE_CONFIG = os.environ.get("FIREBASE")
+
+# Initialize Firebase if available
+db = None
 try:
-    firebase_config = os.environ.get("FIREBASE")
-    if firebase_config:
-        firebase_dict = json.loads(b64decode(firebase_config))
+    if FIREBASE_CONFIG:
+        import firebase_admin
+        from firebase_admin import credentials
+        from firebase_admin import firestore
+        
+        firebase_dict = json.loads(base64.b64decode(FIREBASE_CONFIG))
         cred = credentials.Certificate(firebase_dict)
         firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        print("Firebase initialized successfully")
+    else:
+        print("FIREBASE_CONFIG not found")
 except Exception as e:
     print(f"Firebase initialization error: {str(e)}")
 
-# Set up Flask app with proper template folder
-template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates')
-app = Flask(__name__, template_folder=template_dir)
+# Spotify API endpoints
+SPOTIFY_URL_REFRESH_TOKEN = "https://accounts.spotify.com/api/token"
+SPOTIFY_URL_NOW_PLAYING = "https://api.spotify.com/v1/me/player/currently-playing"
+SPOTIFY_URL_RECENTLY_PLAY = "https://api.spotify.com/v1/me/player/recently-played?limit=10"
+SPOTIFY_URL_GENERATE_TOKEN = "https://accounts.spotify.com/api/token"
+SPOTIFY_URL_USER_INFO = "https://api.spotify.com/v1/me"
 
-# Print debug info
-print(f"Template directory: {template_dir}")
-print(f"Available templates: {os.listdir(template_dir) if os.path.exists(template_dir) else 'Directory not found!'}")
+# Redirect URI for Spotify OAuth
+REDIRECT_URI = f"{BASE_URL}/callback"
 
-# Cache for token info
-CACHE_TOKEN_INFO = {}
+# Helper functions
+def get_authorization():
+    return base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_SECRET_ID}".encode()).decode("ascii")
 
-@functools.lru_cache(maxsize=128)
-def generate_css_bar(num_bar=75):
-    css_bar = ""
-    left = 1
-    for i in range(1, num_bar + 1):
-        anim = random.randint(350, 500)
-        css_bar += ".bar:nth-child({})  {{ left: {}px; animation-duration: {}ms; }}".format(
-            i, left, anim
-        )
-        left += 4
-    return css_bar
-
-def encode_html_entities(text):
-    return html.escape(text)
-
-def to_img_b64(content):
-    return b64encode(content).decode("ascii")
-
-@functools.lru_cache(maxsize=128)
-def load_image(url):
-    response = requests.get(url)
-    return response.content
-
-def make_simple_svg(artist_name, song_name, is_now_playing, theme="default", bar_color="53b14f", background_color="121212"):
-    """Simplified SVG generator that doesn't require PIL"""
-    
-    height = 145
-    num_bar = 75
-
-    # Sanitize input
-    artist_name = encode_html_entities(artist_name)
-    song_name = encode_html_entities(song_name)
-    
-    if is_now_playing:
-        title_text = "Now playing"
-        content_bar = "".join(["<div class='bar'></div>" for i in range(num_bar)])
-        css_bar = generate_css_bar(num_bar)
-    else:
-        title_text = "Recently played"
-        content_bar = ""
-        css_bar = generate_css_bar(num_bar)
-    
-    rendered_data = {
-        "height": height,
-        "num_bar": num_bar,
-        "content_bar": content_bar,
-        "css_bar": css_bar,
-        "title_text": title_text,
-        "artist_name": artist_name,
-        "song_name": song_name,
-        "img": "",
-        "cover_image": False,
-        "bar_color": bar_color,
-        "background_color": background_color,
+def generate_token(code):
+    data = {
+        "grant_type": "authorization_code",
+        "redirect_uri": REDIRECT_URI,
+        "code": code,
     }
-    
-    try:
-        return render_template(f"spotify.{theme}.html.j2", **rendered_data)
-    except Exception as e:
-        print(f"Template rendering error: {str(e)}")
-        # Fallback to simpler rendering if template not found
-        return f"""<svg width="320" height="145" xmlns="http://www.w3.org/2000/svg">
-            <rect width="320" height="145" fill="#{background_color}" rx="10" />
-            <text x="160" y="45" fill="#53b14f" text-anchor="middle" font-family="sans-serif" font-weight="bold">{title_text} on Spotify</text>
-            <text x="160" y="85" fill="#ffffff" text-anchor="middle" font-family="sans-serif" font-weight="bold" font-size="20">{artist_name}</text>
-            <text x="160" y="115" fill="#b3b3b3" text-anchor="middle" font-family="sans-serif" font-size="16">{song_name}</text>
-        </svg>"""
+    headers = {"Authorization": f"Basic {get_authorization()}"}
+    response = requests.post(SPOTIFY_URL_GENERATE_TOKEN, data=data, headers=headers)
+    return response.json()
 
-def get_cache_token_info(uid):
-    token_info = CACHE_TOKEN_INFO.get(uid, None)
-    return token_info
+def refresh_token(refresh_token):
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+    headers = {"Authorization": f"Basic {get_authorization()}"}
+    response = requests.post(SPOTIFY_URL_REFRESH_TOKEN, data=data, headers=headers)
+    return response.json()
 
-def delete_cache_token_info(uid):
-    if uid in CACHE_TOKEN_INFO:
-        del CACHE_TOKEN_INFO[uid]
+def get_user_profile(access_token):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    response = requests.get(SPOTIFY_URL_USER_INFO, headers=headers)
+    return response.json()
+
+def get_now_playing(access_token):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    response = requests.get(SPOTIFY_URL_NOW_PLAYING, headers=headers)
+    if response.status_code == 204:
+        return {}
+    return response.json()
+
+def get_recently_played(access_token):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    response = requests.get(SPOTIFY_URL_RECENTLY_PLAY, headers=headers)
+    if response.status_code == 204:
+        return {}
+    return response.json()
 
 def get_access_token(uid):
-    # Get firestore database
-    db = firestore.client()
-    
-    # Load from firebase
-    doc_ref = db.collection("users").document(uid)
-    doc = doc_ref.get()
-    
-    if not doc.exists:
-        print("User not found in database: {}".format(uid))
+    """Get access token from Firebase"""
+    if not db:
         return None
-    
-    token_info = doc.to_dict()
-    access_token = token_info.get("access_token")
-    
-    return access_token
-
-@app.route("/", defaults={"path": ""})
-@app.route("/<path:path>")
-def catch_all(path):
-    """Main handler for all routes"""
+        
     try:
-        # Login route
-        if path == "login":
-            login_url = f"https://accounts.spotify.com/authorize?client_id={spotify.SPOTIFY_CLIENT_ID}&response_type=code&scope=user-read-currently-playing,user-read-recently-played&redirect_uri={spotify.REDIRECT_URI}"
-            return redirect(login_url)
+        doc_ref = db.collection("users").document(uid)
+        doc = doc_ref.get()
         
-        # Callback route
-        elif path == "callback":
-            code = request.args.get("code")
-            if code is None:
-                return Response("No authorization code provided", status=400)
+        if not doc.exists:
+            print(f"User {uid} not found in database")
+            return None
             
-            try:
-                token_info = spotify.generate_token(code)
-                access_token = token_info["access_token"]
-                
-                spotify_user = spotify.get_user_profile(access_token)
-                user_id = spotify_user["id"]
-                
-                db = firestore.client()
-                doc_ref = db.collection("users").document(user_id)
-                doc_ref.set(token_info)
-                
-                rendered_data = {
-                    "uid": user_id,
-                    "BASE_URL": spotify.BASE_URL,
-                }
-                
-                try:
-                    return render_template("callback.html.j2", **rendered_data)
-                except Exception as template_error:
-                    return f"""
-                    <html>
-                        <body>
-                            <h1>Successfully authenticated with Spotify!</h1>
-                            <p>Your user ID: {user_id}</p>
-                            <p>To create your Spotify GitHub profile, use this URL:</p>
-                            <code>{spotify.BASE_URL}?uid={user_id}</code>
-                            <p>Add it to your GitHub profile README.md using this Markdown:</p>
-                            <pre>![Spotify Recently Played]({spotify.BASE_URL}?uid={user_id})</pre>
-                        </body>
-                    </html>
-                    """
-            except Exception as e:
-                traceback_str = traceback.format_exc()
-                return jsonify({"error": str(e), "traceback": traceback_str}), 500
+        token_info = doc.to_dict()
+        return token_info.get("access_token")
+    except Exception as e:
+        print(f"Error getting access token: {str(e)}")
+        return None
+
+def create_spotify_svg(artist_name, song_name, is_playing=False, theme="default", bar_color="53b14f", background_color="121212"):
+    """Create an SVG showing Spotify information"""
+    title_text = "Now playing" if is_playing else "Recently played"
+    
+    return f"""<svg width="320" height="145" xmlns="http://www.w3.org/2000/svg">
+        <style>
+            .container {{ background-color: #{background_color}; border-radius: 10px; padding: 10px; }}
+            .title {{ color: #53b14f; font-weight: bold; text-align: center; font-family: sans-serif; }}
+            .artist {{ color: #fff; font-weight: bold; font-size: 20px; text-align: center; font-family: sans-serif; }}
+            .song {{ color: #b3b3b3; font-size: 16px; text-align: center; font-family: sans-serif; }}
+        </style>
+        <rect width="320" height="145" fill="#{background_color}" rx="10" />
+        <text x="160" y="30" fill="#53b14f" text-anchor="middle" font-family="sans-serif" font-weight="bold">{title_text} on Spotify</text>
+        <text x="160" y="70" fill="#ffffff" text-anchor="middle" font-family="sans-serif" font-weight="bold" font-size="20">{artist_name}</text>
+        <text x="160" y="100" fill="#b3b3b3" text-anchor="middle" font-family="sans-serif" font-size="16">{song_name}</text>
+    </svg>"""
+
+# Route handlers
+def handle_login():
+    """Handle the /login endpoint to redirect to Spotify"""
+    login_url = f"https://accounts.spotify.com/authorize?client_id={SPOTIFY_CLIENT_ID}&response_type=code&scope=user-read-currently-playing,user-read-recently-played&redirect_uri={REDIRECT_URI}"
+    
+    return {
+        "statusCode": 302,
+        "headers": {
+            "Location": login_url
+        },
+        "body": ""
+    }
+
+def handle_callback(query_params):
+    """Handle the /callback endpoint for Spotify OAuth redirect"""
+    code = query_params.get("code", [""])[0]
+    
+    if not code:
+        return {
+            "statusCode": 400,
+            "body": "No authorization code provided"
+        }
+    
+    try:
+        # Exchange code for token
+        token_info = generate_token(code)
+        access_token = token_info.get("access_token")
         
-        # Main view route (SVG generation)
+        if not access_token:
+            return {
+                "statusCode": 400,
+                "body": "Failed to get access token"
+            }
+        
+        # Get user profile to get the Spotify user ID
+        user_info = get_user_profile(access_token)
+        user_id = user_info.get("id")
+        
+        if not user_id:
+            return {
+                "statusCode": 400,
+                "body": "Failed to get user profile"
+            }
+        
+        # Store token in Firebase
+        if db:
+            doc_ref = db.collection("users").document(user_id)
+            doc_ref.set(token_info)
+            print(f"Saved token for user {user_id}")
+        
+        # Return success HTML
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "text/html"
+            },
+            "body": f"""
+            <html>
+                <body style="font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px;">
+                    <h1 style="color: #1DB954;">Successfully connected with Spotify!</h1>
+                    <p>Your Spotify user ID: <strong>{user_id}</strong></p>
+                    <p>To add this to your GitHub profile, use this URL in an img tag:</p>
+                    <code style="background: #f1f1f1; padding: 10px; display: block;">{BASE_URL}?uid={user_id}</code>
+                    <p>Or add this markdown to your README.md:</p>
+                    <pre style="background: #f1f1f1; padding: 10px;">![Spotify Recently Played]({BASE_URL}?uid={user_id})</pre>
+                </body>
+            </html>
+            """
+        }
+    except Exception as e:
+        traceback_str = traceback.format_exc()
+        print(f"Callback error: {str(e)}\n{traceback_str}")
+        
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "text/html"
+            },
+            "body": f"""
+            <html>
+                <body>
+                    <h1>Error processing Spotify callback</h1>
+                    <p>{str(e)}</p>
+                    <pre>{traceback_str}</pre>
+                </body>
+            </html>
+            """
+        }
+
+def handle_main_view(query_params):
+    """Handle the main view to generate Spotify SVG"""
+    uid = query_params.get("uid", [""])[0]
+    theme = query_params.get("theme", ["default"])[0]
+    bar_color = query_params.get("bar_color", ["53b14f"])[0]
+    background_color = query_params.get("background_color", ["121212"])[0]
+    
+    if not uid:
+        return {
+            "statusCode": 400,
+            "body": "Error: Missing uid parameter"
+        }
+    
+    try:
+        # Get access token
+        access_token = get_access_token(uid)
+        
+        if not access_token:
+            return {
+                "statusCode": 400,
+                "body": "Error: User not found or invalid token"
+            }
+        
+        # Try to get currently playing track
+        now_playing = get_now_playing(access_token)
+        
+        if now_playing and 'item' in now_playing:
+            item = now_playing['item']
+            is_playing = True
         else:
-            uid = request.args.get("uid")
-            theme = request.args.get("theme", default="default")
-            bar_color = request.args.get("bar_color", default="53b14f")
-            background_color = request.args.get("background_color", default="121212")
-            
-            # Handle invalid request
-            if not uid:
-                return Response("Error: Missing uid parameter", status=400)
-            
-            try:
-                access_token = get_access_token(uid)
-                
-                if access_token is None:
-                    return Response("Error: User not found or invalid token", status=400)
-                
-                # Get current playing or recent track
-                now_playing = spotify.get_now_playing(access_token)
-                
-                if now_playing and 'item' in now_playing:
-                    item = now_playing['item']
-                    is_now_playing = True
-                else:
-                    # Get recently played
-                    recent = spotify.get_recently_play(access_token)
-                    if recent and 'items' in recent and len(recent['items']) > 0:
-                        item = recent['items'][0]['track']
-                        is_now_playing = False
-                    else:
-                        return Response("No recent tracks found", status=404)
-                
-                # Extract artist and song name
-                if 'artists' in item:
-                    # It's a track
-                    artist_name = item['artists'][0]['name']
-                    song_name = item['name']
-                elif 'show' in item:
-                    # It's a podcast/episode
-                    artist_name = item['show']['publisher']
-                    song_name = item['name']
-                else:
-                    artist_name = "Unknown Artist"
-                    song_name = item.get('name', 'Unknown Track')
-                
-                # Generate SVG
-                svg = make_simple_svg(
-                    artist_name,
-                    song_name,
-                    is_now_playing,
-                    theme,
-                    bar_color,
-                    background_color
-                )
-                
-                resp = Response(svg, mimetype="image/svg+xml")
-                resp.headers["Cache-Control"] = "s-maxage=1"
-                return resp
-                
-            except Exception as e:
-                traceback_str = traceback.format_exc()
-                return jsonify({
-                    "error": str(e), 
-                    "traceback": traceback_str,
-                    "message": "Error generating Spotify card"
-                }), 500
+            # Fallback to recently played
+            recent = get_recently_played(access_token)
+            if recent and 'items' in recent and len(recent['items']) > 0:
+                item = recent['items'][0]['track']
+                is_playing = False
+            else:
+                # No track found
+                return {
+                    "statusCode": 200,
+                    "headers": {
+                        "Content-Type": "image/svg+xml"
+                    },
+                    "body": create_spotify_svg("Not playing", "No recent tracks", False, theme, bar_color, background_color)
+                }
+        
+        # Extract artist and song name
+        if 'artists' in item:
+            # It's a track
+            artist_name = item['artists'][0]['name']
+            song_name = item['name']
+        elif 'show' in item:
+            # It's a podcast/episode
+            artist_name = item['show']['publisher']
+            song_name = item['name']
+        else:
+            artist_name = "Unknown Artist"
+            song_name = item.get('name', 'Unknown Track')
+        
+        # Generate SVG
+        svg = create_spotify_svg(
+            artist_name,
+            song_name,
+            is_playing,
+            theme,
+            bar_color,
+            background_color
+        )
+        
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "image/svg+xml",
+                "Cache-Control": "s-maxage=1"
+            },
+            "body": svg
+        }
+    except Exception as e:
+        traceback_str = traceback.format_exc()
+        print(f"View error: {str(e)}\n{traceback_str}")
+        
+        # Return an error SVG
+        error_svg = f"""<svg width="320" height="145" xmlns="http://www.w3.org/2000/svg">
+            <rect width="320" height="145" fill="#121212" rx="10" />
+            <text x="160" y="50" fill="#ff5555" text-anchor="middle" font-family="sans-serif" font-weight="bold">Error fetching Spotify data</text>
+            <text x="160" y="80" fill="#ffffff" text-anchor="middle" font-family="sans-serif" font-size="12">{str(e)[:30]}...</text>
+        </svg>"""
+        
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "image/svg+xml"
+            },
+            "body": error_svg
+        }
+
+def handler(req, res):
+    """Main handler for Vercel serverless function"""
+    try:
+        # Extract path and query parameters
+        path = req.get("path", "")
+        
+        # Parse query string
+        url = req.get("url", "")
+        query_string = url.split("?")[1] if "?" in url else ""
+        query_params = {}
+        
+        if query_string:
+            query_params = parse_qs(query_string)
+        
+        # Log request info
+        print(f"Handling request: {path} with params: {query_params}")
+        
+        # Route based on path
+        if path == "/api/login":
+            return handle_login()
+        elif path == "/api/callback":
+            return handle_callback(query_params)
+        else:
+            return handle_main_view(query_params)
             
     except Exception as e:
         traceback_str = traceback.format_exc()
-        return jsonify({"error": str(e), "traceback": traceback_str}), 500
-
-# For local development
-if __name__ == "__main__":
-    app.run(debug=True, port=3000) 
+        print(f"Handler error: {str(e)}\n{traceback_str}")
+        
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "text/html"
+            },
+            "body": f"""
+            <html>
+                <body>
+                    <h1>Server Error</h1>
+                    <p>{str(e)}</p>
+                    <pre>{traceback_str}</pre>
+                </body>
+            </html>
+            """
+        } 
