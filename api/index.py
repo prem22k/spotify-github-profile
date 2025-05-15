@@ -263,10 +263,6 @@ def catch_all(path):
         traceback_str = traceback.format_exc()
         return jsonify({"error": str(e), "traceback": traceback_str}), 500
 
-# Create a WSGI handler for Vercel
-def handler(environ, start_response):
-    return app.wsgi_app(environ, start_response)
-
 # For local development
 if __name__ == "__main__":
     app.run(debug=True, port=3000) 
